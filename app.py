@@ -241,7 +241,7 @@ def run_inference(pil_image: Image.Image, prompt: str, max_tokens: int) -> tuple
 
 
 def _run_mlx_inference(pil_image: Image.Image, prompt: str, max_tokens: int) -> tuple[str, float]:
-    """MLX-VLM local inference."""
+    """MLX-VLM local inference. Must be called from the same thread that loaded the model."""
     from mlx_vlm import generate
     from mlx_vlm.prompt_utils import apply_chat_template
 
@@ -323,10 +323,11 @@ def open_camera(source: int | str = 0) -> str:
 
 def close_camera():
     global _capture
-    if _capture is not None:
-        log.info("Closing camera")
-        _capture.release()
-        _capture = None
+    with _lock:
+        if _capture is not None:
+            log.info("Closing camera")
+            _capture.release()
+            _capture = None
 
 
 def grab_frame() -> Image.Image | None:
@@ -344,6 +345,7 @@ def grab_frame() -> Image.Image | None:
 # ---------------------------------------------------------------------------
 
 def capture_loop(
+    model_name: str,
     prompt: str,
     max_tokens: int,
     interval: float,
@@ -351,9 +353,29 @@ def capture_loop(
     frame_counter: list,
     stop_event: threading.Event,
 ):
-    """Background thread: sole owner of camera reads. Grabs frame -> inference -> append result."""
-    global _latest_frame
+    """Background thread: sole owner of camera reads AND of MLX state. Grabs frame -> inference -> append result."""
+    global _latest_frame, _running
     log.info("Capture loop started")
+
+    try:
+        # MLX arrays are thread-bound (the default GPU stream is thread-local).
+        # Load the model in THIS thread so every subsequent inference call stays
+        # on the same stream. Loading from another thread raises
+        # "There is no Stream(gpu, 0) in current thread."
+        load_msg = load_model(model_name)
+        log.info("capture_loop: %s", load_msg)
+        if _model is None and _backend != "ollama":
+            log.error("Model load failed in worker thread, aborting capture loop")
+            return
+
+        _run_capture(prompt, max_tokens, interval, results_state, frame_counter, stop_event)
+    finally:
+        _running = False
+        log.info("Capture loop exited")
+
+
+def _run_capture(prompt, max_tokens, interval, results_state, frame_counter, stop_event):
+    global _latest_frame
     _no_frame_count = 0
     while not stop_event.is_set():
         # --- read camera (only this thread touches _capture.read) ---
@@ -427,12 +449,6 @@ def on_start(model_name, camera_name, rtsp_url, preset_name, custom_prompt, inte
         log.info("Already running, ignoring")
         return "Already running", gr.update(), format_results(_results)
 
-    # Load model
-    load_msg = load_model(model_name)
-    if _model is None and _backend != "ollama":
-        log.error("Model not loaded, aborting start")
-        return load_msg, gr.update(), ""
-
     # Open camera — resolve sentinel for network stream into the user-provided URL
     source = CAMERAS.get(camera_name, 0)
     if source == "__rtsp_url__":
@@ -462,21 +478,44 @@ def on_start(model_name, camera_name, rtsp_url, preset_name, custom_prompt, inte
 
     _bg_thread = threading.Thread(
         target=capture_loop,
-        args=(prompt, int(max_tokens), interval, _results, _frame_counter, _stop_event),
+        args=(model_name, prompt, int(max_tokens), interval, _results, _frame_counter, _stop_event),
         daemon=True,
     )
     _bg_thread.start()
 
-    return f"{load_msg} | {cam_msg} | Running …", gr.update(), ""
+    return f"{cam_msg} | Loading model & running …", gr.update(), ""
 
 
 def on_stop():
-    global _running, _stop_event, _latest_frame
+    global _running, _stop_event, _latest_frame, _bg_thread
+    global _model, _processor, _config, _loaded_model_id, _backend, _ollama_model
+
     if _stop_event is not None:
         _stop_event.set()
     _running = False
+
+    # Wait for the worker thread to exit before tearing MLX state down.
+    # Otherwise new Start() spawns a second thread while the old one still
+    # holds cv2 + MLX arrays.
+    if _bg_thread is not None and _bg_thread.is_alive():
+        _bg_thread.join(timeout=5.0)
+        if _bg_thread.is_alive():
+            log.warning("Worker thread did not exit in 5s")
+    _bg_thread = None
+
     close_camera()
     _latest_frame = None
+
+    # MLX arrays are bound to the stream of the thread that created them.
+    # That thread is gone, so the cached model is no longer usable from a
+    # fresh worker thread. Drop the cache so the next Start() reloads.
+    _model = None
+    _processor = None
+    _config = None
+    _loaded_model_id = None
+    _backend = None
+    _ollama_model = None
+
     return "Stopped"
 
 

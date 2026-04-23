@@ -1,4 +1,18 @@
-mlx-vlm>=0.4.3
+# MLX stack pinned to the last known-good combination for mlx-vlm.
+# mlx 0.31 changed to thread-local default streams, which breaks mlx-vlm's
+# inference when invoked from a worker thread (std::runtime_error:
+# "There is no Stream(gpu, 0) in current thread."). mlx-vlm 0.4.x pins
+# mlx-lm>=0.31 which pulls in the broken mlx, so we pin the whole chain.
+mlx==0.30.6
+mlx-metal==0.30.6
+mlx-lm==0.30.7
+mlx-vlm==0.3.12
+
+# transformers 5.x's Qwen2VLVideoProcessor hard-depends on torch/torchvision
+# at import time, even though MLX does the actual inference.
+torch>=2.1
+torchvision>=0.16
+
 gradio>=4.0
 opencv-python>=4.8
 Pillow>=10.0
