@@ -48,10 +48,13 @@ class TapoPTZ:
     def _step(self, angle: int) -> None:
         try:
             self._tapo.moveMotorStep(angle)
+            log.info("moveMotorStep(%d) OK", angle)
         except Exception as e:
             msg = str(e)
             if "MOTOR_LOCKED_ROTOR" in msg or "-64304" in msg:
+                log.info("moveMotorStep(%d) LIMIT", angle)
                 raise LimitReachedError(msg) from e
+            log.warning("moveMotorStep(%d) FAILED: %s", angle, e)
             raise
 
     def pan_left(self) -> None:

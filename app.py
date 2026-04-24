@@ -767,9 +767,34 @@ def _do_patrol(notifier) -> None:
             f"扫 {_PATROL_STOPS} 个位置，每位 ~45°"
         )
 
+        # --- Pre-flight: wiggle test (one right, one left) to confirm the
+        # motor is actually responding. If the camera is pinned against one
+        # edge we try the opposite direction before giving up.
+        notifier.send("🧪 电机测试…")
+        wiggle_ok = False
+        wiggle_detail = ""
+        for first, second in (("right", "left"), ("left", "right")):
+            try:
+                (controller.pan_right if first == "right" else controller.pan_left)()
+                time.sleep(0.8)
+                (controller.pan_right if second == "right" else controller.pan_left)()
+                wiggle_ok = True
+                wiggle_detail = f"(尝试 {first}→{second})"
+                break
+            except ptz_mod.LimitReachedError:
+                continue  # try the other direction
+            except Exception as e:
+                notifier.send(f"❌ 电机不响应：{type(e).__name__}: {e}")
+                return
+        if not wiggle_ok:
+            notifier.send("❌ 电机左右方向都报极限，可能卡住了。请在 Tapo App 里手动复位一下。")
+            return
+        notifier.send(f"✅ 电机正常 {wiggle_detail}")
+
         # --- Phase 1: pan left to the edge (known reference: position 0) ---
         notifier.send("↩️ 转到最左…")
-        _pan_to_edge(controller, "left")
+        phase1_left_steps = _pan_to_edge(controller, "left")
+        notifier.send(f"   左转 {phase1_left_steps} 步到达左边界")
 
         # --- Phase 2: sweep right, capturing at each stop ---
         observations: list[str] = []
@@ -824,12 +849,14 @@ def _do_patrol(notifier) -> None:
         notifier.send("🎯 正在复位到中心…")
         right_extra = _pan_to_edge(controller, "right")
         full_range = sweep_right_total + right_extra
-        log.info("Patrol: full pan range = %d steps (sweep=%d + probe=%d)",
-                 full_range, sweep_right_total, right_extra)
+        notifier.send(
+            f"   全 pan 范围 = {full_range} 步（扫了 {sweep_right_total} + 右边探测 {right_extra}）"
+        )
 
         # --- Phase 4: pan left by half the range to land at pan-center ---
         if full_range > 0:
-            _pan_n(controller, "left", full_range // 2)
+            centered_steps = _pan_n(controller, "left", full_range // 2)
+            notifier.send(f"   左转 {centered_steps} 步至中点")
 
         # --- Overall summary ---
         if observations:
