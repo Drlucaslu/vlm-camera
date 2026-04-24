@@ -460,6 +460,28 @@ def grab_frame() -> Image.Image | None:
     return Image.fromarray(rgb)
 
 
+def grab_fresh_frame(drain: int = 10) -> Image.Image | None:
+    """Drain OpenCV's RTSP buffer and return the newest frame.
+
+    OpenCV's FFmpeg backend keeps ~5 decoded frames queued, and read() returns
+    the OLDEST queued frame. After the camera physically moves, the next few
+    read() calls still return pre-motion frames. This helper rapidly grabs
+    several frames to dump the backlog, then retrieves the most recent one.
+    Must be called with `_lock` held since capture_loop also touches
+    `_capture`.
+    """
+    if _capture is None or not _capture.isOpened():
+        return None
+    for _ in range(drain):
+        if not _capture.grab():
+            break
+    ret, frame = _capture.retrieve()
+    if not ret:
+        return None
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb)
+
+
 # ---------------------------------------------------------------------------
 # Main capture loop (runs in a background thread)
 # ---------------------------------------------------------------------------
@@ -694,7 +716,11 @@ _PATROL_STOPS = 5                  # capture at this many positions along the sw
 _PATROL_STEPS_BETWEEN = 2          # right-ward steps between captures (~30°)
 _PATROL_MAX_TRAVEL_STEPS = 20      # safety cap when panning to an edge (~300°)
 _PATROL_MOTOR_SETTLE_S = 0.5       # pause after each motor step
-_PATROL_STREAM_SETTLE_S = 1.5      # pause after arriving at a capture position
+# After a motor stop, Tapo's H.264 encoder + OpenCV's FFmpeg frame buffer
+# together can hold 1.5-3s of pre-move frames. Wait long enough for the
+# encoder to catch up, then we drain the decode queue explicitly before
+# capturing (see grab_fresh_frame).
+_PATROL_STREAM_SETTLE_S = 2.5
 
 
 def _find_ptz_for_current_camera() -> ptz_mod.PTZController | None:
@@ -805,12 +831,12 @@ def _do_patrol(notifier) -> None:
         sweep_right_total = 0  # cumulative right-steps from the left edge
 
         for i in range(_PATROL_STOPS):
-            time.sleep(_PATROL_STREAM_SETTLE_S)  # let RTSP frames catch up
-            frame = _latest_frame
-            if frame is None:
+            time.sleep(_PATROL_STREAM_SETTLE_S)  # let encoder + buffer catch up
+            with _lock:
+                pil = grab_fresh_frame()
+            if pil is None:
                 notifier.send(f"📍 {i + 1}/{_PATROL_STOPS}：画面丢失，跳过")
             else:
-                pil = Image.fromarray(frame)
                 try:
                     text, _ = run_inference(pil, per_stop_prompt, max_tokens=120)
                 except Exception as e:
@@ -830,9 +856,9 @@ def _do_patrol(notifier) -> None:
                     log.info("Hit right edge after %d stops", i + 1)
                     # Capture at the right edge as a bonus final frame
                     time.sleep(_PATROL_STREAM_SETTLE_S)
-                    frame = _latest_frame
-                    if frame is not None:
-                        pil = Image.fromarray(frame)
+                    with _lock:
+                        pil = grab_fresh_frame()
+                    if pil is not None:
                         try:
                             text, _ = run_inference(pil, per_stop_prompt, max_tokens=120)
                         except Exception as e:
