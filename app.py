@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import os
+import queue as _queue
 import time
 import threading
 import urllib.request
@@ -45,11 +46,56 @@ _ollama_model: str | None = None
 _capture: cv2.VideoCapture | None = None
 _running = False
 _lock = threading.Lock()
-# Serializes all VLM inference calls across threads (capture loop + Telegram
-# listener). MLX Metal command buffers are not safe to issue from multiple
-# threads concurrently — this lock is the safety valve.
-_inference_lock = threading.Lock()
 _latest_frame: np.ndarray | None = None  # shared: written by bg thread, read by UI
+
+
+# ---------------------------------------------------------------------------
+# Dedicated inference worker thread
+# ---------------------------------------------------------------------------
+# All MLX operations (load / generate / unload / cache clear) must execute on
+# a single thread. Metal command buffers and MLX arrays are bound to the
+# thread that created them — touching them from a second thread causes
+# assertions like "A command encoder is already encoding to this command
+# buffer". We funnel every load/infer/unload call through this one worker so
+# the capture loop and the Telegram listener can both issue requests safely.
+
+
+class _InferenceWorker:
+    def __init__(self) -> None:
+        self._q: _queue.Queue = _queue.Queue()
+        self._thread = threading.Thread(target=self._run, name="vlm-worker", daemon=True)
+        self._thread.start()
+        log.info("VLM inference worker thread started")
+
+    def _run(self) -> None:
+        while True:
+            fn, args, kwargs, done, box = self._q.get()
+            try:
+                box["value"] = fn(*args, **kwargs)
+            except Exception as e:
+                box["error"] = e
+            finally:
+                done.set()
+
+    def submit(self, fn, *args, **kwargs):
+        """Run `fn(*args, **kwargs)` on the worker thread and block for the result."""
+        done = threading.Event()
+        box: dict = {"value": None, "error": None}
+        self._q.put((fn, args, kwargs, done, box))
+        done.wait()
+        if box["error"] is not None:
+            raise box["error"]
+        return box["value"]
+
+
+_worker: _InferenceWorker | None = None
+
+
+def _get_worker() -> _InferenceWorker:
+    global _worker
+    if _worker is None:
+        _worker = _InferenceWorker()
+    return _worker
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 
@@ -176,6 +222,11 @@ DEFAULT_RTSP_URL = "rtsp://user:pass@host:554/stream1"
 # ---------------------------------------------------------------------------
 
 def load_model(model_name: str) -> str:
+    """Public entry — runs the actual load on the inference worker thread."""
+    return _get_worker().submit(_do_load_model, model_name)
+
+
+def _do_load_model(model_name: str) -> str:
     global _model, _processor, _config, _loaded_model_id, _backend, _ollama_model
     model_id = MODELS[model_name]
     if _loaded_model_id == model_id:
@@ -246,15 +297,18 @@ def _resize_image(pil_image: Image.Image, max_dim: int = 768) -> Image.Image:
 
 
 def run_inference(pil_image: Image.Image, prompt: str, max_tokens: int) -> tuple[str, float]:
-    """Run VLM inference on a single PIL image. Returns (text, elapsed_seconds).
+    """Run VLM inference — dispatched to the single worker thread.
 
-    Thread-safe: acquires _inference_lock so the capture loop and the Telegram
-    listener never issue concurrent Metal command buffers (which crashes MLX).
+    All callers (capture loop + Telegram listener) go through here, and all
+    MLX calls stay on the one worker thread that also owns model weights.
     """
-    with _inference_lock:
-        if _backend == "ollama":
-            return _run_ollama_inference(pil_image, prompt, max_tokens)
-        return _run_mlx_inference(pil_image, prompt, max_tokens)
+    return _get_worker().submit(_do_inference, pil_image, prompt, max_tokens)
+
+
+def _do_inference(pil_image: Image.Image, prompt: str, max_tokens: int) -> tuple[str, float]:
+    if _backend == "ollama":
+        return _run_ollama_inference(pil_image, prompt, max_tokens)
+    return _run_mlx_inference(pil_image, prompt, max_tokens)
 
 
 def _run_mlx_inference(pil_image: Image.Image, prompt: str, max_tokens: int) -> tuple[str, float]:
@@ -657,29 +711,43 @@ def on_stop():
         _monitor_state.scheduler.stop()
     _monitor_state = None
 
-    # Wait for the worker thread to exit before tearing MLX state down.
-    # Otherwise new Start() spawns a second thread while the old one still
-    # holds cv2 + MLX arrays.
+    # Wait for the capture thread to exit so cv2 reads settle before releasing.
     if _bg_thread is not None and _bg_thread.is_alive():
         _bg_thread.join(timeout=5.0)
         if _bg_thread.is_alive():
-            log.warning("Worker thread did not exit in 5s")
+            log.warning("Capture thread did not exit in 5s")
     _bg_thread = None
 
     close_camera()
     _latest_frame = None
 
-    # MLX arrays are bound to the stream of the thread that created them.
-    # That thread is gone, so the cached model is no longer usable from a
-    # fresh worker thread. Drop the cache so the next Start() reloads.
+    # Drop the model cache on the worker thread. MLX arrays are owned by the
+    # thread that allocated them, so unload must happen where load happened.
+    # The worker thread itself lives for the whole process lifetime — only
+    # the weights go away, and the next Start() reloads them on that same
+    # thread, which keeps Metal command buffers consistent.
+    if _worker is not None:
+        try:
+            _worker.submit(_do_unload_model)
+        except Exception:
+            log.exception("Worker-side unload failed")
+
+    return "Stopped"
+
+
+def _do_unload_model() -> None:
+    global _model, _processor, _config, _loaded_model_id, _backend, _ollama_model
     _model = None
     _processor = None
     _config = None
     _loaded_model_id = None
     _backend = None
     _ollama_model = None
-
-    return "Stopped"
+    try:
+        import mlx.core as mx  # type: ignore
+        mx.metal.clear_cache()
+    except Exception:
+        pass
 
 
 def on_preset_change(preset_name):
@@ -839,6 +907,10 @@ def build_ui():
 
 if __name__ == "__main__":
     app = build_ui()
+
+    # Start the inference worker eagerly so Telegram-originated requests
+    # (and the first Start() click) don't race its creation.
+    _get_worker()
 
     # Startup ping — confirms the process is up and Telegram is reachable,
     # independent of whether the user later enables Kid Monitor Mode.
