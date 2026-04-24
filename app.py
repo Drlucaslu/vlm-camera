@@ -686,11 +686,10 @@ def _listener_status() -> str:
 # Patrol: step the camera across the room, narrating each position.
 # ---------------------------------------------------------------------------
 
-# Motor-step counts tuned for Tapo TC71 (~15° per moveMotorStep call).
-# 6 steps ≈ 90° per side, i.e. 180° sweep total split across 5 capture stops.
-_PATROL_STEPS_TO_LEFT_EDGE = 6    # from current pos to leftmost
-_PATROL_STOPS = 5                  # capture at this many positions
-_PATROL_STEPS_BETWEEN = 3          # right-ward steps between captures
+# Motor-step tuning for Tapo TC71 (~15° per moveMotorStep call).
+_PATROL_STOPS = 5                  # capture at this many positions along the sweep
+_PATROL_STEPS_BETWEEN = 3          # right-ward steps between captures (~45°)
+_PATROL_MAX_TRAVEL_STEPS = 20      # safety cap when panning to an edge (~300°)
 _PATROL_MOTOR_SETTLE_S = 0.5       # pause after each motor step
 _PATROL_STREAM_SETTLE_S = 1.5      # pause after arriving at a capture position
 
@@ -705,17 +704,43 @@ def _find_ptz_for_current_camera() -> ptz_mod.PTZController | None:
     return None
 
 
-def _pan(controller: ptz_mod.PTZController, direction: str, steps: int) -> None:
+def _pan_n(controller: ptz_mod.PTZController, direction: str, steps: int) -> int:
+    """Step `direction` up to `steps` times. Returns how many steps actually
+    executed — stops early on LimitReachedError so callers can track real
+    displacement."""
     move = controller.pan_left if direction == "left" else controller.pan_right
+    moved = 0
     for _ in range(steps):
-        move()
+        try:
+            move()
+        except ptz_mod.LimitReachedError:
+            log.info("Motor %s limit reached after %d/%d steps", direction, moved, steps)
+            break
+        moved += 1
         time.sleep(_PATROL_MOTOR_SETTLE_S)
+    return moved
+
+
+def _pan_to_edge(controller: ptz_mod.PTZController, direction: str) -> int:
+    """Pan until the motor reports its physical limit. Returns how many steps
+    it actually took to get there (0 if already at the edge)."""
+    return _pan_n(controller, direction, _PATROL_MAX_TRAVEL_STEPS)
 
 
 def _do_patrol(notifier) -> None:
-    """Step the camera across the room, send per-position photo + VLM narration
-    to Telegram, then synthesize an overall summary. Runs on the listener
-    thread; VLM calls go through the worker queue as usual.
+    """Sweep the camera across the room, send per-position photo + VLM
+    narration to Telegram, then synthesize an overall summary. Restores the
+    camera to its original viewing angle afterwards.
+
+    Four phases:
+      1. Pan fully left until the motor hits its limit (arrive at left edge).
+         Record how many steps this took so we can undo it later.
+      2. 5 capture stops, stepping right N times between each.
+      3. Pan fully left again to return to the left edge.
+      4. Pan right by the Phase-1 step count to restore the original position.
+
+    Runs on the listener thread; VLM calls go through the worker queue as
+    usual.
     """
     if not _running:
         notifier.send("📷 摄像头未启动。请先在 Web UI 点 *Start*。")
@@ -738,25 +763,25 @@ def _do_patrol(notifier) -> None:
     _patrol_active.set()
     try:
         notifier.send(
-            f"🔄 开始巡视，大约 45 秒…\n"
-            f"将扫过 {_PATROL_STOPS} 个位置（约 180°）"
+            f"🔄 开始巡视（约 45-60 秒）\n"
+            f"扫 {_PATROL_STOPS} 个位置，每位 ~45°"
         )
-        # Go to the leftmost position first
-        notifier.send("↩️ 转到最左…")
-        try:
-            _pan(controller, "left", _PATROL_STEPS_TO_LEFT_EDGE)
-        except Exception as e:
-            notifier.send(f"❌ 电机控制失败：{e}")
-            return
 
+        # --- Phase 1: pan left to the edge, remembering how far we went ---
+        notifier.send("↩️ 转到最左…")
+        left_offset = _pan_to_edge(controller, "left")
+        log.info("Patrol phase 1: panned left %d steps to reach edge", left_offset)
+
+        # --- Phase 2: sweep right, capturing at each stop ---
         observations: list[str] = []
         per_stop_prompt = "一句话描述这个画面看到的主要东西和人（20 字内，中文）。"
+        right_travelled = 0  # for logging only
 
         for i in range(_PATROL_STOPS):
-            time.sleep(_PATROL_STREAM_SETTLE_S)  # stream catch up
+            time.sleep(_PATROL_STREAM_SETTLE_S)  # let RTSP frames catch up
             frame = _latest_frame
             if frame is None:
-                notifier.send(f"📍 位置 {i+1}/{_PATROL_STOPS}：画面丢失，跳过")
+                notifier.send(f"📍 {i + 1}/{_PATROL_STOPS}：画面丢失，跳过")
             else:
                 pil = Image.fromarray(frame)
                 try:
@@ -772,13 +797,40 @@ def _do_patrol(notifier) -> None:
                 )
 
             if i < _PATROL_STOPS - 1:
-                try:
-                    _pan(controller, "right", _PATROL_STEPS_BETWEEN)
-                except Exception as e:
-                    notifier.send(f"⚠️ 电机步进失败（{e}），使用已采集的位置生成总览")
+                moved = _pan_n(controller, "right", _PATROL_STEPS_BETWEEN)
+                right_travelled += moved
+                if moved < _PATROL_STEPS_BETWEEN:
+                    log.info("Hit right edge after %d stops", i + 1)
+                    # Do a final capture at the right edge, then stop
+                    time.sleep(_PATROL_STREAM_SETTLE_S)
+                    frame = _latest_frame
+                    if frame is not None:
+                        pil = Image.fromarray(frame)
+                        try:
+                            text, _ = run_inference(pil, per_stop_prompt, max_tokens=120)
+                        except Exception as e:
+                            text = f"（推理失败: {e}）"
+                        observations.append(f"{i + 2}. {text.strip()}")
+                        buf = BytesIO()
+                        pil.save(buf, format="JPEG", quality=85)
+                        notifier.send_photo(
+                            buf.getvalue(),
+                            caption=f"📍 {i + 2}/~ (右边界): {text.strip()}",
+                        )
                     break
+        log.info("Patrol phase 2: swept %d right-steps across %d stops",
+                 right_travelled, len(observations))
 
-        # Overall summary
+        # --- Phase 3 + 4: return to original position ---
+        # Phase 3: pan all the way back to the left edge (a known reference)
+        notifier.send("↩️ 返回…")
+        _pan_to_edge(controller, "left")
+        # Phase 4: restore original viewing angle by panning right the same
+        # number of steps Phase 1 took to reach the left edge
+        if left_offset > 0:
+            _pan_n(controller, "right", left_offset)
+
+        # --- Overall summary ---
         if observations:
             notifier.send("⏳ 正在生成总览…")
             summary_prompt = (
@@ -793,18 +845,7 @@ def _do_patrol(notifier) -> None:
                 summary = f"（总览生成失败：{e}）"
             notifier.send(f"📊 *总览*\n\n{summary}")
 
-        # Return to center (same number of leftward steps we took rightward to
-        # traverse the sweep, plus the initial left-edge offset).
-        total_right_steps = (_PATROL_STOPS - 1) * _PATROL_STEPS_BETWEEN
-        return_left_steps = total_right_steps - _PATROL_STEPS_TO_LEFT_EDGE
-        try:
-            if return_left_steps > 0:
-                _pan(controller, "left", return_left_steps)
-            elif return_left_steps < 0:
-                _pan(controller, "right", -return_left_steps)
-        except Exception:
-            log.exception("Failed to recenter camera after patrol")
-        notifier.send("✅ 巡视完成")
+        notifier.send("✅ 巡视完成，摄像头已回到原位")
     finally:
         _patrol_active.clear()
 

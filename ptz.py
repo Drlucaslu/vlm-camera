@@ -14,6 +14,15 @@ from urllib.parse import urlparse
 log = logging.getLogger("vlm-camera.ptz")
 
 
+class LimitReachedError(Exception):
+    """Raised when the motor hit its physical pan or tilt limit.
+
+    Callers should treat this as "we've arrived at the edge, stop pushing that
+    direction" — NOT as a failure. Every PTZ motor has endstops; running into
+    them is part of normal operation when you're calibrating or sweeping.
+    """
+
+
 class PTZController(Protocol):
     def pan_left(self) -> None: ...
     def pan_right(self) -> None: ...
@@ -26,6 +35,9 @@ class TapoPTZ:
 
     Wraps pytapo's moveMotorStep, which emits one fixed-size motor step per
     call (typically ~15° on TC71). Callers do multiple steps to pan further.
+    Raises LimitReachedError instead of a generic Exception when the camera
+    reports MOTOR_LOCKED_ROTOR (error_code -64304) so the patrol routine can
+    tell "at the edge" apart from "lost connection".
     """
 
     def __init__(self, host: str, user: str, password: str) -> None:
@@ -33,17 +45,26 @@ class TapoPTZ:
         self._tapo = Tapo(host, user, password)
         self._host = host
 
+    def _step(self, angle: int) -> None:
+        try:
+            self._tapo.moveMotorStep(angle)
+        except Exception as e:
+            msg = str(e)
+            if "MOTOR_LOCKED_ROTOR" in msg or "-64304" in msg:
+                raise LimitReachedError(msg) from e
+            raise
+
     def pan_left(self) -> None:
-        self._tapo.moveMotorStep(180)  # 180° = CCW = physically left
+        self._step(180)  # 180° = CCW = physically left
 
     def pan_right(self) -> None:
-        self._tapo.moveMotorStep(0)  # 0° = CW = physically right
+        self._step(0)  # 0° = CW = physically right
 
     def tilt_up(self) -> None:
-        self._tapo.moveMotorStep(90)
+        self._step(90)
 
     def tilt_down(self) -> None:
-        self._tapo.moveMotorStep(270)
+        self._step(270)
 
     def __repr__(self) -> str:
         return f"TapoPTZ({self._host})"
