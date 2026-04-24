@@ -19,6 +19,9 @@ import gradio as gr
 import numpy as np
 from PIL import Image
 
+import monitor as kid_monitor
+import notify
+
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
@@ -118,6 +121,7 @@ PRESETS = {
     "Scene Description (EN)": "Describe the scene in this image.",
     "Object Detection (ZH)": "图中有哪些物体？请列出来。",
     "Object Detection (EN)": "What objects can you see in this image? List them.",
+    "Kid Monitor (ZH)": kid_monitor.MONITOR_PROMPT_ZH,
     "Custom": "",
 }
 
@@ -418,6 +422,12 @@ def _run_capture(prompt, max_tokens, interval, results_state, frame_counter, sto
         }
         results_state.append(entry)
 
+        if _monitor_state is not None:
+            try:
+                kid_monitor.tick(_monitor_state, pil, text)
+            except Exception:
+                log.exception("monitor.tick failed")
+
         # Wait for the remaining interval, but keep updating preview frames
         remaining = interval - elapsed
         deadline = time.time() + remaining
@@ -438,12 +448,29 @@ _bg_thread: threading.Thread | None = None
 _results: list = []
 _frame_counter: list = [0]
 
+# Kid-monitor state — populated by on_start when monitor mode is enabled.
+_monitor_state: kid_monitor.MonitorState | None = None
 
-def on_start(model_name, camera_name, rtsp_url, preset_name, custom_prompt, interval_str, max_tokens):
-    global _running, _stop_event, _bg_thread, _results, _frame_counter
 
-    log.info("=== START clicked === model=%s camera=%s preset=%s interval=%s max_tokens=%s",
-             model_name, camera_name, preset_name, interval_str, max_tokens)
+def _summarize_via_vlm(prompt_text: str) -> str:
+    """Text-only summary via the currently-loaded VLM.
+
+    VLMs need an image input, so we feed a 1x1 grey placeholder and the prompt
+    tells the model to ignore it. The input is already condensed (condense() +
+    top-activities), so this call stays small and fast."""
+    placeholder = Image.new("RGB", (16, 16), color=(128, 128, 128))
+    text, _ = run_inference(placeholder, prompt_text, max_tokens=400)
+    return text
+
+
+def on_start(
+    model_name, camera_name, rtsp_url, preset_name, custom_prompt, interval_str, max_tokens,
+    monitor_enabled, summary_window_min, alert_consecutive,
+):
+    global _running, _stop_event, _bg_thread, _results, _frame_counter, _monitor_state
+
+    log.info("=== START clicked === model=%s camera=%s preset=%s interval=%s max_tokens=%s monitor=%s",
+             model_name, camera_name, preset_name, interval_str, max_tokens, monitor_enabled)
 
     if _running:
         log.info("Already running, ignoring")
@@ -460,12 +487,12 @@ def on_start(model_name, camera_name, rtsp_url, preset_name, custom_prompt, inte
         log.error("Camera not opened, aborting start")
         return cam_msg, gr.update(), ""
 
-    # Determine prompt
-    prompt = custom_prompt.strip()
-    if not prompt:
-        prompt = PRESETS.get(preset_name, "Describe this image.")
-    if not prompt:
-        prompt = "Describe this image."
+    # Determine prompt — monitor mode forces the structured JSON prompt so its
+    # parser/alerting can rely on the output shape.
+    if monitor_enabled:
+        prompt = kid_monitor.MONITOR_PROMPT_ZH
+    else:
+        prompt = custom_prompt.strip() or PRESETS.get(preset_name, "") or "Describe this image."
 
     interval = float(interval_str.replace("s", ""))
     log.info("Starting capture loop: prompt=%r interval=%.1fs max_tokens=%d",
@@ -475,6 +502,23 @@ def on_start(model_name, camera_name, rtsp_url, preset_name, custom_prompt, inte
     _frame_counter = [0]
     _stop_event = threading.Event()
     _running = True
+
+    # Wire up monitor if enabled. Telegram is optional — alerts/summaries still
+    # get logged; they just won't be pushed anywhere.
+    _monitor_state = None
+    if monitor_enabled:
+        notifier = notify.from_env()
+        cfg = kid_monitor.MonitorConfig(
+            enabled=True,
+            summary_window_min=int(summary_window_min),
+            alert_consecutive=int(alert_consecutive),
+        )
+        _monitor_state = kid_monitor.start_monitor(cfg, notifier, _summarize_via_vlm)
+        if notifier is not None:
+            notifier.send(
+                f"🟢 儿童房监控已启动\n采样 {interval:.1f}s / 总结 {cfg.summary_window_min} 分钟 / "
+                f"连续 {cfg.alert_consecutive} 帧触发告警"
+            )
 
     _bg_thread = threading.Thread(
         target=capture_loop,
@@ -487,12 +531,16 @@ def on_start(model_name, camera_name, rtsp_url, preset_name, custom_prompt, inte
 
 
 def on_stop():
-    global _running, _stop_event, _latest_frame, _bg_thread
+    global _running, _stop_event, _latest_frame, _bg_thread, _monitor_state
     global _model, _processor, _config, _loaded_model_id, _backend, _ollama_model
 
     if _stop_event is not None:
         _stop_event.set()
     _running = False
+
+    if _monitor_state is not None and _monitor_state.scheduler is not None:
+        _monitor_state.scheduler.stop()
+    _monitor_state = None
 
     # Wait for the worker thread to exit before tearing MLX state down.
     # Otherwise new Start() spawns a second thread while the old one still
@@ -603,6 +651,26 @@ def build_ui():
                     placeholder="Enter custom prompt …",
                 )
 
+                with gr.Accordion("Kid Monitor Mode", open=False):
+                    gr.Markdown(
+                        "*Enable to override the prompt with a structured JSON monitor prompt, "
+                        "push high-risk alerts to Telegram, and deliver periodic activity summaries. "
+                        "Requires `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`.*"
+                    )
+                    monitor_enabled_cb = gr.Checkbox(
+                        value=False,
+                        label="Enable Kid Monitor",
+                    )
+                    with gr.Row():
+                        summary_window_dd = gr.Dropdown(
+                            choices=["15", "30", "60"],
+                            value="30",
+                            label="Summary every (min)",
+                        )
+                        alert_consecutive_num = gr.Number(
+                            value=2, label="Alert consecutive frames", precision=0,
+                        )
+
                 with gr.Row():
                     start_btn = gr.Button("Start", variant="primary", size="lg")
                     stop_btn = gr.Button("Stop", variant="stop", size="lg")
@@ -632,7 +700,11 @@ def build_ui():
 
         start_btn.click(
             on_start,
-            inputs=[model_dd, camera_dd, rtsp_url_txt, preset_dd, prompt_txt, interval_dd, max_tokens_num],
+            inputs=[
+                model_dd, camera_dd, rtsp_url_txt, preset_dd, prompt_txt,
+                interval_dd, max_tokens_num,
+                monitor_enabled_cb, summary_window_dd, alert_consecutive_num,
+            ],
             outputs=[status_txt, camera_img, results_md],
         )
         stop_btn.click(on_stop, outputs=[status_txt])
@@ -646,9 +718,21 @@ def build_ui():
 
 if __name__ == "__main__":
     app = build_ui()
+
+    # Startup ping — confirms the process is up and Telegram is reachable,
+    # independent of whether the user later enables Kid Monitor Mode.
+    _startup_notifier = notify.from_env()
+    if _startup_notifier is not None:
+        port = int(os.environ.get("GRADIO_SERVER_PORT", 7860))
+        _startup_notifier.send(
+            f"🟢 *VLM Camera 已启动*\n"
+            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"地址: http://127.0.0.1:{port}"
+        )
+
     app.launch(
         server_name="127.0.0.1",
-        server_port=7860,
+        server_port=int(os.environ.get("GRADIO_SERVER_PORT", 7860)),
         theme=gr.themes.Soft(primary_hue="green"),
         css="""
         .result-box { max-height: 80vh; overflow-y: auto; }
