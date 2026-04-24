@@ -1,11 +1,13 @@
 [
   {
     "name": "Tapo Living Room (HD)",
-    "url": "rtsp://USERNAME:PASSWORD@192.168.1.10:554/stream1"
+    "url": "rtsp://USERNAME:PASSWORD@192.168.1.10:554/stream1",
+    "ptz": { "type": "tapo" }
   },
   {
     "name": "Tapo Living Room (SD)",
-    "url": "rtsp://USERNAME:PASSWORD@192.168.1.10:554/stream2"
+    "url": "rtsp://USERNAME:PASSWORD@192.168.1.10:554/stream2",
+    "ptz": { "type": "tapo" }
   },
   {
     "name": "Hikvision Garage",

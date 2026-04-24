@@ -35,6 +35,7 @@ _HELP_TEXT = (
     "• `地面干净吗？`\n"
     "• `桌上有什么东西？`\n"
     "• `过去 15 分钟怎么样？`\n"
+    "• `巡视一下` 或 `/patrol` — 左右扫视整个房间\n"
     "• `截图` 或 `/snapshot`\n"
     "• `/help` · `/status`"
 )
@@ -48,6 +49,7 @@ class ListenerServices:
     ask_history: Callable[[int], str]
     snapshot_jpeg: Callable[[], bytes | None]
     status: Callable[[], str]
+    patrol: Callable[["notify.TelegramNotifier"], None]
 
 
 class TelegramListener:
@@ -140,6 +142,9 @@ class TelegramListener:
         if low in ("/snapshot", "/photo", "截图", "发图", "snapshot"):
             self._snapshot_reply()
             return
+        if low in ("/patrol", "patrol", "巡视", "扫一遍"):
+            self._svc.patrol(self._svc.notifier)
+            return
 
         # Everything else goes through VLM intent classifier
         intent = self._svc.classify(text)
@@ -154,6 +159,8 @@ class TelegramListener:
             self._svc.notifier.send(_HELP_TEXT)
         elif itype == "snapshot":
             self._snapshot_reply()
+        elif itype == "patrol":
+            self._svc.patrol(self._svc.notifier)
         elif itype == "history":
             minutes = int(intent.get("minutes") or 15)
             minutes = max(1, min(minutes, 720))  # 1 min – 12 h

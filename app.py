@@ -23,6 +23,7 @@ from PIL import Image
 import listener as tg_listener
 import monitor as kid_monitor
 import notify
+import ptz as ptz_mod
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -47,6 +48,8 @@ _capture: cv2.VideoCapture | None = None
 _running = False
 _lock = threading.Lock()
 _latest_frame: np.ndarray | None = None  # shared: written by bg thread, read by UI
+_current_source: int | str | None = None  # what open_camera() is currently holding
+_patrol_active = threading.Event()  # set while a /patrol is running
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +217,11 @@ def _load_network_cameras() -> list[dict]:
         if not name or not url:
             log.warning("cameras.json[%d] missing name/url, skipped", i)
             continue
-        entries.append({"name": name, "url": url})
+        # Keep the original entry so optional keys (e.g. ptz) survive.
+        entry = dict(item)
+        entry["name"] = name
+        entry["url"] = url
+        entries.append(entry)
     return entries
 
 
@@ -403,7 +410,7 @@ def _run_ollama_inference(pil_image: Image.Image, prompt: str, max_tokens: int) 
 # ---------------------------------------------------------------------------
 
 def open_camera(source: int | str = 0) -> str:
-    global _capture
+    global _capture, _current_source
     if _capture is not None and _capture.isOpened():
         log.info("Camera already open")
         return "Camera already open"
@@ -429,16 +436,18 @@ def open_camera(source: int | str = 0) -> str:
     if not ret:
         log.warning("Camera opened but cannot read frames")
 
+    _current_source = source
     return f"Camera opened: {source}"
 
 
 def close_camera():
-    global _capture
+    global _capture, _current_source
     with _lock:
         if _capture is not None:
             log.info("Closing camera")
             _capture.release()
             _capture = None
+    _current_source = None
 
 
 def grab_frame() -> Image.Image | None:
@@ -500,6 +509,13 @@ def _run_capture(prompt, max_tokens, interval, results_state, frame_counter, sto
             if _no_frame_count % 10 == 1:
                 log.warning("No frame from camera (attempt %d)", _no_frame_count)
             time.sleep(0.5)
+            continue
+
+        # While a /patrol is running the motor is physically moving and the
+        # listener thread owns the VLM. Skip this tick's inference — preview
+        # frames still flow because the next block keeps polling them.
+        if _patrol_active.is_set():
+            stop_event.wait(timeout=0.5)
             continue
 
         _no_frame_count = 0
@@ -581,6 +597,7 @@ _INTENT_PROMPT = (
     '- {"type":"history","minutes":N}  用户想总结过去某段时间的情况（如"过去15分钟"、"最近半小时"、"刚才"）\n'
     '- {"type":"visual"}                用户在问当前画面里的事（如"有几个人"、"地面干净吗"、"桌上有什么"）\n'
     '- {"type":"snapshot"}              用户想要一张当前画面的照片（如"截图"、"发张图"、"现在什么样"）\n'
+    '- {"type":"patrol"}                用户想让摄像头左右旋转扫视整个房间（如"巡视一下"、"扫一遍办公室"、"转一圈看看"、"整个房间看一下"）\n'
     '- {"type":"help"}                   用户打招呼、问如何使用、/help\n'
     '对 history：根据语义估算 minutes（"过去15分钟"=15，"最近半小时"=30，"一小时"=60，"刚才"=5）。拿不准就 15。\n\n'
     "用户消息：{msg}\n\nJSON："
@@ -663,6 +680,133 @@ def _listener_status() -> str:
         model = _loaded_model_id.split("/")[-1] if _loaded_model_id else "?"
         return f"运行中 · 帧 {_frame_counter[0]} · 模型 {model}"
     return "摄像头未启动（到 Web UI 点 Start 开始）"
+
+
+# ---------------------------------------------------------------------------
+# Patrol: step the camera across the room, narrating each position.
+# ---------------------------------------------------------------------------
+
+# Motor-step counts tuned for Tapo TC71 (~15° per moveMotorStep call).
+# 6 steps ≈ 90° per side, i.e. 180° sweep total split across 5 capture stops.
+_PATROL_STEPS_TO_LEFT_EDGE = 6    # from current pos to leftmost
+_PATROL_STOPS = 5                  # capture at this many positions
+_PATROL_STEPS_BETWEEN = 3          # right-ward steps between captures
+_PATROL_MOTOR_SETTLE_S = 0.5       # pause after each motor step
+_PATROL_STREAM_SETTLE_S = 1.5      # pause after arriving at a capture position
+
+
+def _find_ptz_for_current_camera() -> ptz_mod.PTZController | None:
+    """Return a PTZ controller for whichever camera is currently open, or None."""
+    if _current_source is None or not isinstance(_current_source, str):
+        return None
+    for entry in _load_network_cameras():
+        if entry.get("url") == _current_source:
+            return ptz_mod.from_camera_entry(entry)
+    return None
+
+
+def _pan(controller: ptz_mod.PTZController, direction: str, steps: int) -> None:
+    move = controller.pan_left if direction == "left" else controller.pan_right
+    for _ in range(steps):
+        move()
+        time.sleep(_PATROL_MOTOR_SETTLE_S)
+
+
+def _do_patrol(notifier) -> None:
+    """Step the camera across the room, send per-position photo + VLM narration
+    to Telegram, then synthesize an overall summary. Runs on the listener
+    thread; VLM calls go through the worker queue as usual.
+    """
+    if not _running:
+        notifier.send("📷 摄像头未启动。请先在 Web UI 点 *Start*。")
+        return
+    if _loaded_model_id is None:
+        notifier.send("📷 模型未加载。")
+        return
+    if _patrol_active.is_set():
+        notifier.send("⚠️ 已经有一个巡视在进行中，请稍候。")
+        return
+
+    controller = _find_ptz_for_current_camera()
+    if controller is None:
+        notifier.send(
+            "❌ 当前摄像头不支持 PTZ 巡视。\n"
+            "请先在 Web UI 选择支持 PTZ 的 Tapo 摄像头（`cameras.json` 里带 `\"ptz\"` 字段的那种）。"
+        )
+        return
+
+    _patrol_active.set()
+    try:
+        notifier.send(
+            f"🔄 开始巡视，大约 45 秒…\n"
+            f"将扫过 {_PATROL_STOPS} 个位置（约 180°）"
+        )
+        # Go to the leftmost position first
+        notifier.send("↩️ 转到最左…")
+        try:
+            _pan(controller, "left", _PATROL_STEPS_TO_LEFT_EDGE)
+        except Exception as e:
+            notifier.send(f"❌ 电机控制失败：{e}")
+            return
+
+        observations: list[str] = []
+        per_stop_prompt = "一句话描述这个画面看到的主要东西和人（20 字内，中文）。"
+
+        for i in range(_PATROL_STOPS):
+            time.sleep(_PATROL_STREAM_SETTLE_S)  # stream catch up
+            frame = _latest_frame
+            if frame is None:
+                notifier.send(f"📍 位置 {i+1}/{_PATROL_STOPS}：画面丢失，跳过")
+            else:
+                pil = Image.fromarray(frame)
+                try:
+                    text, _ = run_inference(pil, per_stop_prompt, max_tokens=120)
+                except Exception as e:
+                    text = f"（推理失败: {e}）"
+                observations.append(f"{i + 1}. {text.strip()}")
+                buf = BytesIO()
+                pil.save(buf, format="JPEG", quality=85)
+                notifier.send_photo(
+                    buf.getvalue(),
+                    caption=f"📍 {i + 1}/{_PATROL_STOPS}: {text.strip()}",
+                )
+
+            if i < _PATROL_STOPS - 1:
+                try:
+                    _pan(controller, "right", _PATROL_STEPS_BETWEEN)
+                except Exception as e:
+                    notifier.send(f"⚠️ 电机步进失败（{e}），使用已采集的位置生成总览")
+                    break
+
+        # Overall summary
+        if observations:
+            notifier.send("⏳ 正在生成总览…")
+            summary_prompt = (
+                "以下是刚刚从左到右巡视房间时，摄像头在各个位置看到的内容：\n\n"
+                + "\n".join(observations)
+                + "\n\n请用中文写一段简洁的总览（150 字以内），包含：\n"
+                + "1) 整体情况  2) 人员分布与大致总数  3) 是否有异常或值得注意的事。"
+            )
+            try:
+                summary = _summarize_via_vlm(summary_prompt).strip()
+            except Exception as e:
+                summary = f"（总览生成失败：{e}）"
+            notifier.send(f"📊 *总览*\n\n{summary}")
+
+        # Return to center (same number of leftward steps we took rightward to
+        # traverse the sweep, plus the initial left-edge offset).
+        total_right_steps = (_PATROL_STOPS - 1) * _PATROL_STEPS_BETWEEN
+        return_left_steps = total_right_steps - _PATROL_STEPS_TO_LEFT_EDGE
+        try:
+            if return_left_steps > 0:
+                _pan(controller, "left", return_left_steps)
+            elif return_left_steps < 0:
+                _pan(controller, "right", -return_left_steps)
+        except Exception:
+            log.exception("Failed to recenter camera after patrol")
+        notifier.send("✅ 巡视完成")
+    finally:
+        _patrol_active.clear()
 
 
 def on_start(
@@ -975,6 +1119,7 @@ if __name__ == "__main__":
             ask_history=_ask_history,
             snapshot_jpeg=_snapshot_jpeg,
             status=_listener_status,
+            patrol=_do_patrol,
         )
         tg_listener.start_from_env(_services)
 

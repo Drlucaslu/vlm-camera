@@ -16,3 +16,8 @@ torchvision>=0.16
 gradio>=4.0
 opencv-python>=4.8
 Pillow>=10.0
+
+# Tapo PTZ control (pan/tilt cameras like TC71, C200, C210, C225, C500).
+# Optional at runtime — cameras without a "ptz" field in cameras.json work
+# fine without this installed, but /patrol Telegram command requires it.
+pytapo==3.4.13
