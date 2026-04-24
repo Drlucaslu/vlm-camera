@@ -5,6 +5,8 @@ venv/
 .env
 .env.*
 !.env.example
+cameras.json
+!cameras.json.example
 .DS_Store
 *.egg-info/
 .ruff_cache/

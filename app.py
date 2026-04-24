@@ -182,11 +182,47 @@ PRESETS = {
 INTERVALS = ["1.0s", "2.0s", "3.0s", "5.0s", "10.0s"]
 
 
+CAMERAS_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "cameras.json")
+
+
+def _load_network_cameras() -> list[dict]:
+    """Read the local cameras.json (if present) and return its entries.
+
+    Schema: a JSON list of objects, each with "name" and "url" strings.
+    URLs embed their own credentials (e.g. rtsp://user:pass@host:port/path),
+    so the file is gitignored and never leaves the user's machine. Missing
+    or malformed file => empty list (just the local USB cameras + manual
+    RTSP option will be offered in the UI).
+    """
+    if not os.path.isfile(CAMERAS_CONFIG_PATH):
+        return []
+    try:
+        with open(CAMERAS_CONFIG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log.warning("Could not read %s: %s", CAMERAS_CONFIG_PATH, e)
+        return []
+    if not isinstance(data, list):
+        log.warning("%s must be a JSON list of {name,url} objects", CAMERAS_CONFIG_PATH)
+        return []
+    entries = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        url = str(item.get("url", "")).strip()
+        if not name or not url:
+            log.warning("cameras.json[%d] missing name/url, skipped", i)
+            continue
+        entries.append({"name": name, "url": url})
+    return entries
+
+
 def detect_cameras(max_index: int = 5) -> dict[str, int | str]:
     """Probe available cameras and return {label: source} dict.
 
     Source is an int index for local USB/built-in cameras, or a string URL
-    (e.g. rtsp://...) for network cameras.
+    (e.g. rtsp://...) for network cameras loaded from cameras.json.
     """
     cameras: dict[str, int | str] = {}
     for i in range(max_index):
@@ -196,20 +232,24 @@ def detect_cameras(max_index: int = 5) -> dict[str, int | str]:
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             cameras[f"Camera {i} ({w}x{h})"] = i
             cap.release()
-    # Preset network cameras — credentials & host pulled from env so nothing
-    # sensitive lands in the repo. Set TAPO_USER / TAPO_PASS / TAPO_HOST
-    # (e.g. in a local .env or shell profile) to enable these entries.
-    tapo_user = os.environ.get("TAPO_USER")
-    tapo_pass = os.environ.get("TAPO_PASS")
-    tapo_host = os.environ.get("TAPO_HOST", "192.168.4.243")
-    if tapo_user and tapo_pass:
-        base = f"rtsp://{tapo_user}:{tapo_pass}@{tapo_host}:554"
-        cameras[f"Tapo @ {tapo_host} (HD)"] = f"{base}/stream1"
-        cameras[f"Tapo @ {tapo_host} (SD)"] = f"{base}/stream2"
-    # Generic: user supplies RTSP URL at runtime (see UI)
+    # Network cameras come from a local cameras.json file (gitignored).
+    # Each entry is {"name": ..., "url": "rtsp://..."}. Users can list as
+    # many cameras as they want — any brand, any auth scheme.
+    for entry in _load_network_cameras():
+        # Names collide-safely with existing keys; later entries overwrite
+        # earlier ones, which mirrors normal dict semantics.
+        cameras[entry["name"]] = entry["url"]
+    # Generic fallback: user pastes an RTSP URL into the UI textbox.
     cameras["Network Camera (custom RTSP URL)"] = "__rtsp_url__"
-    safe = {k: (v if not (isinstance(v, str) and v.startswith("rtsp://")) else "rtsp://***") for k, v in cameras.items()}
-    log.info("Detected cameras: %s", safe)
+
+    def _redact(v):
+        if isinstance(v, str) and "://" in v and "@" in v:
+            scheme = v.split("://", 1)[0]
+            tail = v.split("@", 1)[1]
+            return f"{scheme}://***@{tail}"
+        return v
+
+    log.info("Detected cameras: %s", {k: _redact(v) for k, v in cameras.items()})
     return cameras
 
 
