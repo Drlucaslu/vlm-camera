@@ -19,6 +19,7 @@ import gradio as gr
 import numpy as np
 from PIL import Image
 
+import listener as tg_listener
 import monitor as kid_monitor
 import notify
 
@@ -44,6 +45,10 @@ _ollama_model: str | None = None
 _capture: cv2.VideoCapture | None = None
 _running = False
 _lock = threading.Lock()
+# Serializes all VLM inference calls across threads (capture loop + Telegram
+# listener). MLX Metal command buffers are not safe to issue from multiple
+# threads concurrently — this lock is the safety valve.
+_inference_lock = threading.Lock()
 _latest_frame: np.ndarray | None = None  # shared: written by bg thread, read by UI
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -241,10 +246,15 @@ def _resize_image(pil_image: Image.Image, max_dim: int = 768) -> Image.Image:
 
 
 def run_inference(pil_image: Image.Image, prompt: str, max_tokens: int) -> tuple[str, float]:
-    """Run VLM inference on a single PIL image. Returns (text, elapsed_seconds)."""
-    if _backend == "ollama":
-        return _run_ollama_inference(pil_image, prompt, max_tokens)
-    return _run_mlx_inference(pil_image, prompt, max_tokens)
+    """Run VLM inference on a single PIL image. Returns (text, elapsed_seconds).
+
+    Thread-safe: acquires _inference_lock so the capture loop and the Telegram
+    listener never issue concurrent Metal command buffers (which crashes MLX).
+    """
+    with _inference_lock:
+        if _backend == "ollama":
+            return _run_ollama_inference(pil_image, prompt, max_tokens)
+        return _run_mlx_inference(pil_image, prompt, max_tokens)
 
 
 def _run_mlx_inference(pil_image: Image.Image, prompt: str, max_tokens: int) -> tuple[str, float]:
@@ -419,6 +429,7 @@ def _run_capture(prompt, max_tokens, interval, results_state, frame_counter, sto
         entry = {
             "frame": frame_no,
             "time": now,
+            "ts": time.time(),
             "infer": f"{elapsed:.2f}s",
             "model": model_label,
             "text": text,
@@ -464,6 +475,100 @@ def _summarize_via_vlm(prompt_text: str) -> str:
     placeholder = Image.new("RGB", (16, 16), color=(128, 128, 128))
     text, _ = run_inference(placeholder, prompt_text, max_tokens=400)
     return text
+
+
+# ---------------------------------------------------------------------------
+# Telegram listener service callables
+# ---------------------------------------------------------------------------
+
+_INTENT_PROMPT = (
+    "你是家庭摄像头助手的调度器。根据用户的一条消息，只输出一行紧凑的 JSON（不要任何其他文字、不要代码块）。\n"
+    "可能的 type：\n"
+    '- {"type":"history","minutes":N}  用户想总结过去某段时间的情况（如"过去15分钟"、"最近半小时"、"刚才"）\n'
+    '- {"type":"visual"}                用户在问当前画面里的事（如"有几个人"、"地面干净吗"、"桌上有什么"）\n'
+    '- {"type":"snapshot"}              用户想要一张当前画面的照片（如"截图"、"发张图"、"现在什么样"）\n'
+    '- {"type":"help"}                   用户打招呼、问如何使用、/help\n'
+    '对 history：根据语义估算 minutes（"过去15分钟"=15，"最近半小时"=30，"一小时"=60，"刚才"=5）。拿不准就 15。\n\n'
+    "用户消息：{msg}\n\nJSON："
+)
+
+
+def _classify_intent(user_msg: str) -> dict:
+    """VLM-backed intent classifier. Falls back to 'visual' on parse failure."""
+    if _loaded_model_id is None:
+        return {"type": "not_ready"}
+    prompt = _INTENT_PROMPT.replace("{msg}", user_msg)
+    try:
+        raw = _summarize_via_vlm(prompt).strip()
+    except Exception:
+        log.exception("Intent classifier failed")
+        return {"type": "visual"}
+    # Peel off accidental code-fence wrapping
+    if raw.startswith("```"):
+        raw = "\n".join(l for l in raw.split("\n") if not l.startswith("```"))
+    # Grab first balanced {...}
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if 0 <= start < end:
+        try:
+            parsed = json.loads(raw[start:end + 1])
+            if isinstance(parsed, dict) and "type" in parsed:
+                return parsed
+        except Exception:
+            pass
+    log.warning("Could not parse classifier output; defaulting to visual. raw=%r", raw[:200])
+    return {"type": "visual"}
+
+
+def _ask_visual(question: str) -> str:
+    """Run VLM inference on the most recent frame with the user's question."""
+    if _loaded_model_id is None:
+        return "模型还没加载（请在 Web UI 点 Start 启动摄像头和模型）。"
+    frame = _latest_frame
+    if frame is None:
+        return "当前没有画面（摄像头未启动？）"
+    pil = Image.fromarray(frame)
+    text, _ = run_inference(pil, question, max_tokens=300)
+    return text or "（模型返回了空回复）"
+
+
+def _ask_history(minutes: int) -> str:
+    """Summarize capture-loop results within the last `minutes` via text-only VLM."""
+    cutoff = time.time() - minutes * 60
+    entries = [r for r in _results if r.get("ts", 0) >= cutoff]
+    if not entries:
+        return f"过去 {minutes} 分钟内没有记录（摄像头可能没有在运行）。"
+    if _loaded_model_id is None:
+        # Unusual: have history but model unloaded. Just dump raw timestamps.
+        lines = [f"{r['time']}  {r['text']}" for r in entries[-20:]]
+        return "（模型未加载，以下是原始记录）\n" + "\n".join(lines)
+
+    lines = [f"{r['time']}  {r['text']}" for r in entries[-80:]]
+    compact = "\n".join(lines)
+    prompt = (
+        f"以下是过去 {minutes} 分钟家庭摄像头的观察记录（每行一帧）。"
+        f"请用中文写一段简洁的总结（200 字内），重点描述：主要活动、人员出入、异常或值得注意的变化。"
+        f"如果期间没什么事，就用一两句话说明。忽略这条指令文字本身，不要复述记录原文。\n\n"
+        f"记录：\n{compact}\n\n总结："
+    )
+    return _summarize_via_vlm(prompt).strip()
+
+
+def _snapshot_jpeg() -> bytes | None:
+    """Encode the latest captured frame as JPEG bytes, or None if no frame."""
+    frame = _latest_frame
+    if frame is None:
+        return None
+    buf = BytesIO()
+    Image.fromarray(frame).save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def _listener_status() -> str:
+    if _running:
+        model = _loaded_model_id.split("/")[-1] if _loaded_model_id else "?"
+        return f"运行中 · 帧 {_frame_counter[0]} · 模型 {model}"
+    return "摄像头未启动（到 Web UI 点 Start 开始）"
 
 
 def on_start(
@@ -743,8 +848,21 @@ if __name__ == "__main__":
         _startup_notifier.send(
             f"🟢 *VLM Camera 已启动*\n"
             f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"地址: http://127.0.0.1:{port}"
+            f"地址: http://127.0.0.1:{port}\n"
+            f"在 Telegram 发 `/help` 查看可用指令。"
         )
+        # Always-on Telegram listener: accepts questions regardless of whether
+        # the user has clicked Start. Replies gracefully when the model/camera
+        # isn't loaded yet.
+        _services = tg_listener.ListenerServices(
+            notifier=_startup_notifier,
+            classify=_classify_intent,
+            ask_visual=_ask_visual,
+            ask_history=_ask_history,
+            snapshot_jpeg=_snapshot_jpeg,
+            status=_listener_status,
+        )
+        tg_listener.start_from_env(_services)
 
     app.launch(
         server_name="127.0.0.1",
