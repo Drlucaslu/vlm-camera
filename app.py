@@ -767,15 +767,14 @@ def _do_patrol(notifier) -> None:
             f"扫 {_PATROL_STOPS} 个位置，每位 ~45°"
         )
 
-        # --- Phase 1: pan left to the edge, remembering how far we went ---
+        # --- Phase 1: pan left to the edge (known reference: position 0) ---
         notifier.send("↩️ 转到最左…")
-        left_offset = _pan_to_edge(controller, "left")
-        log.info("Patrol phase 1: panned left %d steps to reach edge", left_offset)
+        _pan_to_edge(controller, "left")
 
         # --- Phase 2: sweep right, capturing at each stop ---
         observations: list[str] = []
         per_stop_prompt = "一句话描述这个画面看到的主要东西和人（20 字内，中文）。"
-        right_travelled = 0  # for logging only
+        sweep_right_total = 0  # cumulative right-steps from the left edge
 
         for i in range(_PATROL_STOPS):
             time.sleep(_PATROL_STREAM_SETTLE_S)  # let RTSP frames catch up
@@ -798,10 +797,10 @@ def _do_patrol(notifier) -> None:
 
             if i < _PATROL_STOPS - 1:
                 moved = _pan_n(controller, "right", _PATROL_STEPS_BETWEEN)
-                right_travelled += moved
+                sweep_right_total += moved
                 if moved < _PATROL_STEPS_BETWEEN:
                     log.info("Hit right edge after %d stops", i + 1)
-                    # Do a final capture at the right edge, then stop
+                    # Capture at the right edge as a bonus final frame
                     time.sleep(_PATROL_STREAM_SETTLE_S)
                     frame = _latest_frame
                     if frame is not None:
@@ -818,17 +817,19 @@ def _do_patrol(notifier) -> None:
                             caption=f"📍 {i + 2}/~ (右边界): {text.strip()}",
                         )
                     break
-        log.info("Patrol phase 2: swept %d right-steps across %d stops",
-                 right_travelled, len(observations))
 
-        # --- Phase 3 + 4: return to original position ---
-        # Phase 3: pan all the way back to the left edge (a known reference)
-        notifier.send("↩️ 返回…")
-        _pan_to_edge(controller, "left")
-        # Phase 4: restore original viewing angle by panning right the same
-        # number of steps Phase 1 took to reach the left edge
-        if left_offset > 0:
-            _pan_n(controller, "right", left_offset)
+        # --- Phase 3: probe the right edge to measure the full pan range ---
+        # We're at position `sweep_right_total` from the left edge. Push to
+        # the right edge, counting extra steps — their sum is the total range.
+        notifier.send("🎯 正在复位到中心…")
+        right_extra = _pan_to_edge(controller, "right")
+        full_range = sweep_right_total + right_extra
+        log.info("Patrol: full pan range = %d steps (sweep=%d + probe=%d)",
+                 full_range, sweep_right_total, right_extra)
+
+        # --- Phase 4: pan left by half the range to land at pan-center ---
+        if full_range > 0:
+            _pan_n(controller, "left", full_range // 2)
 
         # --- Overall summary ---
         if observations:
@@ -845,7 +846,7 @@ def _do_patrol(notifier) -> None:
                 summary = f"（总览生成失败：{e}）"
             notifier.send(f"📊 *总览*\n\n{summary}")
 
-        notifier.send("✅ 巡视完成，摄像头已回到原位")
+        notifier.send("✅ 巡视完成，摄像头已复位至正中间")
     finally:
         _patrol_active.clear()
 
