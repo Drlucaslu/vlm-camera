@@ -687,8 +687,11 @@ def _listener_status() -> str:
 # ---------------------------------------------------------------------------
 
 # Motor-step tuning for Tapo TC71 (~15° per moveMotorStep call).
+# TC71 measured pan range ≈ 9 steps (~135°) on this unit, so 4 intervals of
+# 2 steps each gives ~8-step coverage — fits cleanly inside the range with
+# one step of headroom at each end.
 _PATROL_STOPS = 5                  # capture at this many positions along the sweep
-_PATROL_STEPS_BETWEEN = 3          # right-ward steps between captures (~45°)
+_PATROL_STEPS_BETWEEN = 2          # right-ward steps between captures (~30°)
 _PATROL_MAX_TRAVEL_STEPS = 20      # safety cap when panning to an edge (~300°)
 _PATROL_MOTOR_SETTLE_S = 0.5       # pause after each motor step
 _PATROL_STREAM_SETTLE_S = 1.5      # pause after arriving at a capture position
