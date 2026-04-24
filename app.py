@@ -121,7 +121,10 @@ PRESETS = {
     "Scene Description (EN)": "Describe the scene in this image.",
     "Object Detection (ZH)": "图中有哪些物体？请列出来。",
     "Object Detection (EN)": "What objects can you see in this image? List them.",
-    "Kid Monitor (ZH)": kid_monitor.MONITOR_PROMPT_ZH,
+    # Scene monitor profiles — identical prompts to what Scene Monitor Mode
+    # uses, exposed here so users can run a scene prompt without enabling the
+    # alert + summary pipeline.
+    **{p.name: p.prompt for p in kid_monitor.PROFILES.values()},
     "Custom": "",
 }
 
@@ -465,12 +468,13 @@ def _summarize_via_vlm(prompt_text: str) -> str:
 
 def on_start(
     model_name, camera_name, rtsp_url, preset_name, custom_prompt, interval_str, max_tokens,
-    monitor_enabled, summary_window_min, alert_consecutive,
+    monitor_enabled, monitor_profile_name, summary_window_min, alert_consecutive,
 ):
     global _running, _stop_event, _bg_thread, _results, _frame_counter, _monitor_state
 
-    log.info("=== START clicked === model=%s camera=%s preset=%s interval=%s max_tokens=%s monitor=%s",
-             model_name, camera_name, preset_name, interval_str, max_tokens, monitor_enabled)
+    log.info("=== START clicked === model=%s camera=%s preset=%s interval=%s max_tokens=%s monitor=%s profile=%s",
+             model_name, camera_name, preset_name, interval_str, max_tokens,
+             monitor_enabled, monitor_profile_name)
 
     if _running:
         log.info("Already running, ignoring")
@@ -487,10 +491,14 @@ def on_start(
         log.error("Camera not opened, aborting start")
         return cam_msg, gr.update(), ""
 
-    # Determine prompt — monitor mode forces the structured JSON prompt so its
-    # parser/alerting can rely on the output shape.
+    # Determine prompt — monitor mode forces the selected scene profile's
+    # JSON prompt so the parser/alerting can rely on the output shape.
+    profile = next(
+        (p for p in kid_monitor.PROFILES.values() if p.name == monitor_profile_name),
+        kid_monitor.PROFILES["kid"],
+    )
     if monitor_enabled:
-        prompt = kid_monitor.MONITOR_PROMPT_ZH
+        prompt = profile.prompt
     else:
         prompt = custom_prompt.strip() or PRESETS.get(preset_name, "") or "Describe this image."
 
@@ -510,13 +518,15 @@ def on_start(
         notifier = notify.from_env()
         cfg = kid_monitor.MonitorConfig(
             enabled=True,
+            profile=profile,
             summary_window_min=int(summary_window_min),
             alert_consecutive=int(alert_consecutive),
         )
         _monitor_state = kid_monitor.start_monitor(cfg, notifier, _summarize_via_vlm)
         if notifier is not None:
             notifier.send(
-                f"🟢 儿童房监控已启动\n采样 {interval:.1f}s / 总结 {cfg.summary_window_min} 分钟 / "
+                f"🟢 *{profile.name} 已启动*\n"
+                f"采样 {interval:.1f}s / 总结 {cfg.summary_window_min} 分钟 / "
                 f"连续 {cfg.alert_consecutive} 帧触发告警"
             )
 
@@ -651,15 +661,20 @@ def build_ui():
                     placeholder="Enter custom prompt …",
                 )
 
-                with gr.Accordion("Kid Monitor Mode", open=False):
+                with gr.Accordion("Scene Monitor Mode", open=False):
                     gr.Markdown(
-                        "*Enable to override the prompt with a structured JSON monitor prompt, "
-                        "push high-risk alerts to Telegram, and deliver periodic activity summaries. "
-                        "Requires `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`.*"
+                        "*Enable to switch the VLM to the selected scene's structured JSON prompt, "
+                        "push high-priority alerts to Telegram, and deliver periodic activity "
+                        "summaries. Requires `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`.*"
                     )
                     monitor_enabled_cb = gr.Checkbox(
                         value=False,
-                        label="Enable Kid Monitor",
+                        label="Enable Scene Monitor",
+                    )
+                    monitor_profile_dd = gr.Dropdown(
+                        choices=[p.name for p in kid_monitor.PROFILES.values()],
+                        value=kid_monitor.PROFILES["kid"].name,
+                        label="Scene",
                     )
                     with gr.Row():
                         summary_window_dd = gr.Dropdown(
@@ -703,7 +718,8 @@ def build_ui():
             inputs=[
                 model_dd, camera_dd, rtsp_url_txt, preset_dd, prompt_txt,
                 interval_dd, max_tokens_num,
-                monitor_enabled_cb, summary_window_dd, alert_consecutive_num,
+                monitor_enabled_cb, monitor_profile_dd,
+                summary_window_dd, alert_consecutive_num,
             ],
             outputs=[status_txt, camera_img, results_md],
         )

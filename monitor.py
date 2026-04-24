@@ -30,9 +30,24 @@ from PIL import Image
 log = logging.getLogger("vlm-camera.monitor")
 
 # ---------------------------------------------------------------------------
-# Default danger list (tune freely; VLM is told to pick risk_level from here)
+# Scene monitor profiles
 # ---------------------------------------------------------------------------
-DANGER_CATEGORIES = [
+# Every profile emits the same universal fields (activity, risk_level,
+# risk_reason) so the alert + summary pipeline stays generic. Domain-specific
+# secondary fields (num_children, num_customers, cleanliness, ...) are allowed
+# in the JSON but are only used visually in the result pane — the alerting
+# code trusts risk_level/risk_reason only.
+
+@dataclass(frozen=True)
+class MonitorProfile:
+    id: str
+    name: str  # shown in UI + included in Telegram summary header
+    prompt: str
+    summary_intro: str
+
+
+# --- Kid Monitor ---------------------------------------------------------
+_KID_DANGERS = [
     "打闹/肢体冲突",
     "攀爬桌椅或柜子",
     "靠近或翻越窗户",
@@ -44,8 +59,7 @@ DANGER_CATEGORIES = [
     "屋内出现陌生人",
     "从高处坠落的姿势",
 ]
-
-MONITOR_PROMPT_ZH = (
+_KID_PROMPT = (
     "你是一个儿童房安全监控助手。看这张画面，只输出一行合法 JSON，"
     "不要写解释、不要用代码块围栏。\n"
     "\n"
@@ -57,7 +71,7 @@ MONITOR_PROMPT_ZH = (
     "- risk_level: 只能是 \"none\" / \"low\" / \"medium\" / \"high\" 其中之一。\n"
     "- risk_reason: string — risk_level 为 none 时必须是空字符串 \"\"；"
     "否则从下面清单里原文选一项填入：\n"
-    "  " + " | ".join(DANGER_CATEGORIES) + "\n"
+    "  " + " | ".join(_KID_DANGERS) + "\n"
     "\n"
     "判定规则（非常重要，严格遵守）：\n"
     "- 日常写作业、学习、看书、看平板、用电脑、画画、玩玩具、休息、发呆、空房间 → risk_level 必须是 \"none\"。\n"
@@ -68,6 +82,147 @@ MONITOR_PROMPT_ZH = (
     "输出格式示例（仅供格式参考，不要照抄内容）：\n"
     '{"activity": "坐在桌前写作业", "num_children": 1, "risk_level": "none", "risk_reason": ""}'
 )
+_KID_SUMMARY = (
+    "你是一位细心的家长助手。下面是过去一段时间孩子房间的活动日志摘要，"
+    "请用中文写 2-4 句自然总结：孩子整体在做什么、有没有值得留意的地方。"
+    "不要逐条罗列、不要重复时间戳。"
+)
+
+
+# --- Office Monitor ------------------------------------------------------
+_OFFICE_ALERTS = [
+    "人员受伤或倒地",
+    "激烈争执或肢体冲突",
+    "明火或浓烟",
+    "非授权人员闯入",
+    "设备倒塌或漏水",
+    "可疑的破坏或翻找行为",
+]
+_OFFICE_PROMPT = (
+    "你是一个办公室监控助手。看这张画面，只输出一行合法 JSON，"
+    "不要写解释、不要用代码块围栏。\n"
+    "\n"
+    "字段与类型：\n"
+    "- activity: string — 用 3 到 15 个汉字描述此刻办公室主要状态，"
+    "例如\"多人围桌开会\"、\"个人专注工作\"、\"员工休息聊天\"、\"办公室无人\"。"
+    "严禁照抄本说明里的任何字样或圆括号里的例子。\n"
+    "- num_people: integer — 画面中可见人数，没看到填 0。\n"
+    "- focus_state: 字符串，只能是 \"focused\" / \"meeting\" / \"casual\" / \"idle\" / \"unknown\" 之一。\n"
+    "- risk_level: 只能是 \"none\" / \"low\" / \"medium\" / \"high\" 之一。\n"
+    "- risk_reason: string — risk_level 为 none 时必须是空字符串 \"\"；"
+    "否则从下面清单里原文选一项填入：\n"
+    "  " + " | ".join(_OFFICE_ALERTS) + "\n"
+    "\n"
+    "判定规则（严格遵守）：\n"
+    "- 正常工作、开会、讨论、打电话、走动、短暂休息 → risk_level 必须是 \"none\"。\n"
+    "- 只有清单里所列、而且正在发生的事才是 \"high\"。\n"
+    "- 冒烟但未着火、陌生人徘徊等苗头用 \"medium\"。\"low\" 基本不用。\n"
+    "\n"
+    "输出格式示例（仅供格式参考，不要照抄内容）：\n"
+    '{"activity": "多人围桌开会", "num_people": 4, "focus_state": "meeting", "risk_level": "none", "risk_reason": ""}'
+)
+_OFFICE_SUMMARY = (
+    "你是一位办公室运营助手。下面是过去一段时间办公室的活动日志摘要，"
+    "请用中文写 2-4 句话概括：整体工作氛围、主要活动、人员流动大致情况，"
+    "以及有没有需要关注的异常。不要逐条罗列、不要重复时间戳。"
+)
+
+
+# --- Retail Store Monitor ------------------------------------------------
+_RETAIL_ALERTS = [
+    "顾客进店无人接待",
+    "员工忽视顾客玩手机",
+    "桌面或柜台明显脏乱",
+    "垃圾或污渍堆积",
+    "顾客之间发生争执",
+    "人员受伤或倒地",
+    "非授权人员闯入",
+    "明火或浓烟",
+]
+_RETAIL_PROMPT = (
+    "你是一个门店运营监控助手。看这张画面，只输出一行合法 JSON，"
+    "不要写解释、不要用代码块围栏。\n"
+    "\n"
+    "字段与类型：\n"
+    "- activity: string — 用 3 到 15 个汉字描述当前门店场景，"
+    "例如\"顾客在浏览商品\"、\"员工正在接待顾客\"、\"员工无事可做\"、\"门店无人\"、\"员工正在打扫\"。"
+    "严禁照抄本说明里的任何字样或圆括号里的例子。\n"
+    "- num_customers: integer — 可见顾客数，没看到填 0。\n"
+    "- num_staff: integer — 可见员工数，没看到填 0。\n"
+    "- staff_engagement: 字符串，只能是 \"active\" / \"passive\" / \"none\" / \"n/a\" 之一。"
+    "active=员工正在积极服务；passive=员工在场但玩手机或聊天忽视顾客；"
+    "none=有顾客但现场无员工；n/a=此刻画面中没有顾客。\n"
+    "- cleanliness: 字符串，只能是 \"good\" / \"fair\" / \"poor\" 之一，描述桌面/柜台/地面的整洁程度。\n"
+    "- risk_level: 只能是 \"none\" / \"low\" / \"medium\" / \"high\" 之一。\n"
+    "- risk_reason: string — risk_level 为 none 时必须是空字符串 \"\"；"
+    "否则从下面清单里原文选一项填入：\n"
+    "  " + " | ".join(_RETAIL_ALERTS) + "\n"
+    "\n"
+    "判定规则（严格遵守）：\n"
+    "- 正常接待、结账、整理货品、无人时段、日常打扫 → risk_level 必须是 \"none\"。\n"
+    "- 只有清单里所列、而且正在发生的才是 \"high\"。\n"
+    "- 员工消极但勉强在场、桌面略乱等苗头用 \"medium\"。\"low\" 基本不用。\n"
+    "\n"
+    "输出格式示例（仅供格式参考，不要照抄内容）：\n"
+    '{"activity": "员工正在为顾客介绍商品", "num_customers": 1, "num_staff": 1, "staff_engagement": "active", "cleanliness": "good", "risk_level": "none", "risk_reason": ""}'
+)
+_RETAIL_SUMMARY = (
+    "你是一位门店运营助手。下面是过去一段时间门店的活动日志摘要，"
+    "请用中文写 2-4 句话概括：客流大致情况、员工服务状态、卫生状况，"
+    "以及有没有值得店长处理的问题。不要逐条罗列、不要重复时间戳。"
+)
+
+
+# --- Home Security -------------------------------------------------------
+_SECURITY_ALERTS = [
+    "陌生人闯入",
+    "非正常时段有人活动",
+    "门窗被强行打开",
+    "明火或浓烟",
+    "玻璃或物品破碎",
+    "人员倒地不动",
+    "屋内宠物异常（剧烈挣扎或受困）",
+]
+_SECURITY_PROMPT = (
+    "你是一个家庭安防监控助手。看这张画面，只输出一行合法 JSON，"
+    "不要写解释、不要用代码块围栏。\n"
+    "\n"
+    "字段与类型：\n"
+    "- activity: string — 用 3 到 15 个汉字描述当前场景，"
+    "例如\"房间无人\"、\"家人在沙发上看电视\"、\"宠物在地上休息\"、\"门口有陌生人\"。"
+    "严禁照抄本说明里的任何字样或圆括号里的例子。\n"
+    "- num_people: integer — 可见人数，没看到填 0。\n"
+    "- num_pets: integer — 可见宠物数，没看到填 0。\n"
+    "- risk_level: 只能是 \"none\" / \"low\" / \"medium\" / \"high\" 之一。\n"
+    "- risk_reason: string — risk_level 为 none 时必须是空字符串 \"\"；"
+    "否则从下面清单里原文选一项填入：\n"
+    "  " + " | ".join(_SECURITY_ALERTS) + "\n"
+    "\n"
+    "判定规则（严格遵守）：\n"
+    "- 房间无人、家庭成员在正常活动、宠物正常休息或走动 → risk_level 必须是 \"none\"。\n"
+    "- 只有清单里所列、而且正在发生的才是 \"high\"。\n"
+    "- 有苗头（门虚掩、有人在门外张望）用 \"medium\"。\"low\" 基本不用。\n"
+    "\n"
+    "输出格式示例（仅供格式参考，不要照抄内容）：\n"
+    '{"activity": "客厅无人安静", "num_people": 0, "num_pets": 1, "risk_level": "none", "risk_reason": ""}'
+)
+_SECURITY_SUMMARY = (
+    "你是一位家庭安防助手。下面是过去一段时间家中监控的活动日志摘要，"
+    "请用中文写 2-4 句话概括：整体是否安静平稳、有没有人员进出或异常事件。"
+    "不要逐条罗列、不要重复时间戳。"
+)
+
+
+PROFILES: dict[str, MonitorProfile] = {
+    "kid": MonitorProfile("kid", "Kid Monitor (ZH)", _KID_PROMPT, _KID_SUMMARY),
+    "office": MonitorProfile("office", "Office Monitor (ZH)", _OFFICE_PROMPT, _OFFICE_SUMMARY),
+    "retail": MonitorProfile("retail", "Retail Store Monitor (ZH)", _RETAIL_PROMPT, _RETAIL_SUMMARY),
+    "security": MonitorProfile("security", "Home Security (ZH)", _SECURITY_PROMPT, _SECURITY_SUMMARY),
+}
+
+# Backward-compatible export — some early code referenced this by name.
+MONITOR_PROMPT_ZH = PROFILES["kid"].prompt
+DANGER_CATEGORIES = _KID_DANGERS
 
 
 # ---------------------------------------------------------------------------
@@ -284,11 +439,15 @@ class SummaryScheduler:
         window_min: int,
         notifier,
         summarize_fn: SummaryFn,
+        summary_intro: str,
+        profile_name: str,
     ) -> None:
         self._log = log_store
         self._window_min = window_min
         self._notifier = notifier
         self._summarize = summarize_fn
+        self._summary_intro = summary_intro
+        self._profile_name = profile_name
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._next_ts: float = 0.0
@@ -333,12 +492,7 @@ class SummaryScheduler:
             log.info("Summary skipped: no parsed activity in window")
             return
 
-        prompt = (
-            "你是一位细心的家长助手。下面是过去一段时间孩子房间的活动日志摘要，"
-            "请用中文写一段 2-4 句话的自然总结，概括孩子这段时间的整体状态、主要做什么、"
-            "有没有值得留意的地方。不要逐条罗列，不要重复原始时间戳。\n\n"
-            f"{compact}"
-        )
+        prompt = f"{self._summary_intro}\n\n{compact}"
         try:
             summary = self._summarize(prompt).strip()
         except Exception as e:
@@ -346,7 +500,7 @@ class SummaryScheduler:
             summary = f"（本地模型总结失败：{e}）\n\n{compact}"
 
         msg = (
-            f"🕒 *儿童房 {self._window_min} 分钟活动总结*\n"
+            f"🕒 *{self._profile_name} — {self._window_min} 分钟活动总结*\n"
             f"{datetime.now().strftime('%H:%M:%S')}\n\n"
             f"{summary}"
         )
@@ -361,6 +515,7 @@ class SummaryScheduler:
 @dataclass
 class MonitorConfig:
     enabled: bool = False
+    profile: MonitorProfile = field(default_factory=lambda: PROFILES["kid"])
     summary_window_min: int = 30
     alert_consecutive: int = 2
     alert_cooldown_sec: float = 120.0
@@ -386,7 +541,12 @@ def start_monitor(
         cooldown_sec=cfg.alert_cooldown_sec,
     )
     state.scheduler = SummaryScheduler(
-        state.log, cfg.summary_window_min, notifier, summarize_fn
+        state.log,
+        cfg.summary_window_min,
+        notifier,
+        summarize_fn,
+        summary_intro=cfg.profile.summary_intro,
+        profile_name=cfg.profile.name,
     )
     state.scheduler.start()
     return state
