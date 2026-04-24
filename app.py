@@ -172,12 +172,12 @@ PRESETS = {
     "Scene Description (EN)": "Describe the scene in this image.",
     "Object Detection (ZH)": "图中有哪些物体？请列出来。",
     "Object Detection (EN)": "What objects can you see in this image? List them.",
-    # Scene monitor profiles — identical prompts to what Scene Monitor Mode
-    # uses, exposed here so users can run a scene prompt without enabling the
-    # alert + summary pipeline.
-    **{p.name: p.prompt for p in kid_monitor.PROFILES.values()},
     "Custom": "",
 }
+# Monitor profiles (Kid, …) intentionally live only in the Monitor Mode
+# accordion below — they bring an alert + periodic-summary pipeline with
+# them, so mixing them into PRESETS caused name collisions and confusion
+# about which dropdown actually enabled monitoring.
 
 INTERVALS = ["1.0s", "2.0s", "3.0s", "5.0s", "10.0s"]
 
@@ -834,20 +834,22 @@ def build_ui():
                     placeholder="Enter custom prompt …",
                 )
 
-                with gr.Accordion("Scene Monitor Mode", open=False):
+                with gr.Accordion("Monitor Mode", open=False):
                     gr.Markdown(
-                        "*Enable to switch the VLM to the selected scene's structured JSON prompt, "
+                        "*Enable to switch the VLM to the selected mode's structured JSON prompt, "
                         "push high-priority alerts to Telegram, and deliver periodic activity "
-                        "summaries. Requires `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`.*"
+                        "summaries. Requires `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`. "
+                        "When enabled the PRESET dropdown above is ignored — this mode drives the "
+                        "prompt.*"
                     )
                     monitor_enabled_cb = gr.Checkbox(
                         value=False,
-                        label="Enable Scene Monitor",
+                        label="Enable Monitor Mode",
                     )
                     monitor_profile_dd = gr.Dropdown(
                         choices=[p.name for p in kid_monitor.PROFILES.values()],
                         value=kid_monitor.PROFILES["kid"].name,
-                        label="Scene",
+                        label="Mode",
                     )
                     with gr.Row():
                         summary_window_dd = gr.Dropdown(
